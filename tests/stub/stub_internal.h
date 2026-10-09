@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 typedef struct {
-    long calls, fill_px, rows, sprite_px, slow_px, text_px, chars;
+    long calls, fill_px, rows, sprite_px, slow_px, text_px, chars, direct;
 } cost_t;
 
 extern uint8_t vram[2][240][320];
@@ -19,4 +19,7 @@ void stub_on_swap(void);
 void stub_feed_keys(uint8_t *kb);
 size_t stub_var_size(const char *name);
 int stub_var_archived(const char *name);
+extern int stub_gfx_ended, stub_ghost_on;
+extern long stub_writes;
+void stub_ghost(uint8_t *kb);
 #endif

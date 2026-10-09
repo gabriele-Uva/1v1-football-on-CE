@@ -26,6 +26,7 @@ void kb_Scan(void);
 #define kb_Prgm     (1<<6)
 #define kb_RParen   (1<<4)
 #define kb_Vars     (1<<6)
+#define kb_Stat     (1<<7)
 #define kb_Enter    (1<<0)
 #define kb_Clear    (1<<6)
 #define kb_Down     (1<<0)

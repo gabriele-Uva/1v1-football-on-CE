@@ -69,10 +69,13 @@ static void fill_clip(int x, int y, int w, int h, uint8_t c)
     cost.rows += y1 - y;
 }
 
-void gfx_Begin(void) { memset(vram, 0, sizeof vram); }
-void gfx_End(void) {}
+void gfx_Begin(void) { memset(vram, 0, sizeof vram); stub_gfx_ended = 0; }
+int stub_gfx_ended = 0;
+long stub_writes = 0;
+void gfx_End(void) { stub_gfx_ended = 1; }
 uint8_t gfx_SetColor(uint8_t index) { uint8_t o = color; color = index; return o; }
-uint8_t gfx_SetTransparentColor(uint8_t index) { (void)index; return 0; }
+uint8_t stub_transp = 0;
+uint8_t gfx_SetTransparentColor(uint8_t index) { uint8_t o = stub_transp; stub_transp = index; return o; }
 void gfx_SetPalette(const void *palette, uint24_t size, uint8_t offset)
 {
     if (offset + size / 2 > 256) violation("palette", (int)size, offset, 0, 0);
@@ -227,6 +230,23 @@ void gfx_Sprite(const gfx_sprite_t *spr, int x, int y)
         }
     }
 }
+void gfx_TransparentSprite(const gfx_sprite_t *spr, int x, int y)
+{
+    int i, j;
+    cost.calls++;
+    for (j = 0; j < spr->height; j++) {
+        int py = y + j;
+        if (py < cy0 || py >= cy1) continue;
+        cost.rows++;
+        for (i = 0; i < spr->width; i++) {
+            int px = x + i;
+            uint8_t c = spr->data[j * spr->width + i];
+            if (px < cx0 || px >= cx1) continue;
+            cost.sprite_px++;
+            if (c != stub_transp) target()[py][px] = c;
+        }
+    }
+}
 gfx_sprite_t *gfx_GetSprite(gfx_sprite_t *spr, int x, int y)
 {
     int i, j;
@@ -246,9 +266,27 @@ void gfx_SetClipRegion(int xmin, int ymin, int xmax, int ymax)
 }
 
 uint8_t (*stub_draw_buffer(void))[320] { return target(); }
+uint8_t (*stub_vbuf(void))[240][320] { cost.direct += 8; return &vram[scr_idx ^ 1]; }
+void gfx_Wait(void) {}
 
 /* ---------------- keypad ---------------- */
-void kb_Scan(void) { stub_feed_keys(stub_kb_data); }
+/* keypad matrix ghosting: rows sharing a pressed column get connected */
+void stub_ghost(uint8_t *kb)
+{
+    int ch = 1, a, b;
+    while (ch) {
+        ch = 0;
+        for (a = 1; a < 8; a++)
+            for (b = 1; b < 8; b++)
+                if (a != b && (kb[a] & kb[b])) {
+                    uint8_t u = (uint8_t)(kb[a] | kb[b]);
+                    if (kb[a] != u) { kb[a] = u; ch = 1; }
+                    if (kb[b] != u) { kb[b] = u; ch = 1; }
+                }
+    }
+}
+int stub_ghost_on = 1;
+void kb_Scan(void) { stub_feed_keys(stub_kb_data); if (stub_ghost_on) stub_ghost(stub_kb_data); }
 
 /* ---------------- fileioc ---------------- */
 typedef struct { char name[9]; uint8_t data[4096]; size_t size; int used; int archived; } var_t;
@@ -280,6 +318,7 @@ size_t ti_Write(const void *data, size_t size, size_t count, uint8_t h)
 {
     var_t *v = &vars[handles[h].var];
     size_t n = size * count;
+    stub_writes++;
     if (!handles[h].open || handles[h].pos + n > sizeof v->data) return 0;
     memcpy(v->data + handles[h].pos, data, n);
     handles[h].pos += n;

@@ -2,3 +2,4 @@ FBLEGEND/bin/
 FBLEGEND/obj/
 tests/*.o
 tests/harness
+tests/harness_fast

@@ -22,6 +22,11 @@ typedef enum { gfx_text_clip = 1, gfx_text_noclip } gfx_text_options_t;
 #define gfx_RGBTo1555(r,g,b) \
 ((uint16_t)(((((r) & 255) >> 3) << 10) | ((((g) & 255) >> 3) << 5) | (((b) & 255) >> 3)))
 
+extern uint16_t stub_pal[256];
+#define gfx_palette stub_pal
+uint8_t (*stub_vbuf(void))[240][320];
+#define gfx_vbuffer (*stub_vbuf())
+void gfx_Wait(void);
 #define gfx_SetDrawBuffer() gfx_SetDraw(gfx_buffer)
 #define gfx_SetDrawScreen() gfx_SetDraw(gfx_screen)
 
@@ -52,6 +57,7 @@ uint8_t gfx_SetTextBGColor(uint8_t color);
 uint8_t gfx_SetTextTransparentColor(uint8_t color);
 void gfx_SetMonospaceFont(uint8_t spacing);
 void gfx_Sprite(const gfx_sprite_t *sprite, int x, int y);
+void gfx_TransparentSprite(const gfx_sprite_t *sprite, int x, int y);
 gfx_sprite_t *gfx_GetSprite(gfx_sprite_t *sprite_buffer, int x, int y);
 void gfx_SetClipRegion(int xmin, int ymin, int xmax, int ymax);
 
