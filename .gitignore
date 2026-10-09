@@ -1,0 +1,4 @@
+FBLEGEND/bin/
+FBLEGEND/obj/
+tests/*.o
+tests/harness
