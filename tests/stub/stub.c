@@ -54,10 +54,11 @@ static inline void pset_clip(int x, int y, uint8_t c)
     if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) target()[y][x] = c;
 }
 
+static int in_shape;   /* rows of a circle / triangle: graphx draws them internally */
 static void fill_clip(int x, int y, int w, int h, uint8_t c)
 {
     int x1 = x + w, y1 = y + h, yy;
-    cost.calls++;
+    if (!in_shape) cost.calls++;
     if (x < cx0) x = cx0;
     if (y < cy0) y = cy0;
     if (x1 > cx1) x1 = cx1;
@@ -144,16 +145,19 @@ void gfx_FillCircle(int xc, int yc, uint24_t radius)
 {
     int r = (int)radius, y;
     cost.calls++;
+    in_shape = 1;
     for (y = -r; y <= r; y++) {
         int w = 0;
         while ((w + 1) * (w + 1) + y * y <= r * r + r) w++;
         fill_clip(xc - w, yc + y, 2 * w + 1, 1, color);
     }
+    in_shape = 0;
 }
 void gfx_FillTriangle(int x0, int y0, int x1, int y1, int x2, int y2)
 {
     int miny = y0, maxy = y0, y;
     cost.calls++;
+    in_shape = 1;
     if (y1 < miny) miny = y1;
     if (y2 < miny) miny = y2;
     if (y1 > maxy) maxy = y1;
@@ -176,6 +180,7 @@ void gfx_FillTriangle(int x0, int y0, int x1, int y1, int x2, int y2)
             fill_clip(a, y, b - a + 1, 1, color);
         }
     }
+    in_shape = 0;
 }
 void gfx_SetDraw(uint8_t location) { draw_to_screen = location == gfx_screen; }
 void gfx_SwapDraw(void)

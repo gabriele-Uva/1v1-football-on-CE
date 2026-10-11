@@ -1,9 +1,13 @@
-FOOTBALL LEGENDS CE  (version 2)
+FOOTBALL LEGENDS CE  (version 3)
 ================================
 A 2D side-view "head soccer" game for the TI-84 Plus CE, styled after
 Football Legends (Madpuffers, Poki). Written in C for the CE C/C++
 Toolchain (CEdev). One player against the computer, or two players on one
 calculator.
+
+What is new in version 3: much faster drawing, now up to 60 frames per
+second (version 2 lagged on real calculators); player 1's supershot is on
+MODE; player 2 plays on the number keys 1 2 3 5 with + and -.
 
 
 1. BUILDING (Windows)
@@ -25,7 +29,7 @@ Steps:
   1. Install CEdev (https://ce-programming.github.io/toolchain/).
   2. Open the CEdev command prompt (cedev.bat), cd into the FBLEGEND
      folder and type:   make
-  3. The program is written to  FBLEGEND\bin\FBLEGEND.8xp  (about 42 KB,
+  3. The program is written to  FBLEGEND\bin\FBLEGEND.8xp  (about 43 KB,
      archived and compressed).
   4. Send FBLEGEND.8xp to the calculator with TI Connect CE.
   5. The calculator also needs the CE C libraries (clibs.8xg: graphx,
@@ -41,18 +45,19 @@ Player 1:
     Up             jump (hold to keep jumping)
     Down           slide tackle
     2nd            shoot / kick
-    Alpha          supershot (your legend's ability, when the ring is full)
+    MODE           supershot (your legend's ability, when the ring is full)
 
-Player 2 (2-player modes):
-    APPS           run left
-    VARS           run right
-    STAT           jump
-    PRGM           slide tackle
-    (              shoot / kick
-    )              supershot
+Player 2 (2-player modes), on the number keys:
+    1              run left
+    3              run right
+    5              jump
+    2              slide tackle
+    +              shoot / kick
+    -              supershot
 
-    On the keypad STAT sits above PRGM, with APPS and VARS either side:
-    an upside-down T like the arrow keys. ( and ) are two rows below.
+    5 sits above 2, with 1 and 3 either side: an upside-down T like the
+    arrow keys. + is right next to 3 and - right next to 6, so the
+    right-hand fingers rest on + and -.
 
 Everyone:
     Clear          pause menu (Resume / Restart / Quit to menu)
@@ -63,25 +68,28 @@ Everyone:
 The same layouts are shown in the CONTROLS screen of the title menu and on
 the panels at the start of every match.
 
-Why these keys (keypad ghosting)
+Keypad ghosting (read this if two players share the calculator)
 The CE keypad is a matrix of 7 groups x 8 bits without diodes. When keys
 in two groups share a bit, the two groups become connected and the
-calculator can read keys that are not pressed. I simulated that rule for
-every realistic situation: each player holding nothing / left / right,
-with or without jump, plus nothing / shoot / slide / supershot, both
-players at the same time (24 x 24 = 576 combinations). The game's own key
-decoder was run on the "ghosted" keypad state and compared with the real
-presses, and phantom presses of CLEAR (pause) and of the panic keys were
-counted as errors too.
-    This layout:                       0 of 576 combinations go wrong.
-    Number pad (4 6 8 5 1 0) for P2: 156 of 576 go wrong (for example
-    player 1 jumping while player 2 jumps and slides reads as a phantom
-    RIGHT for player 1), because the number keys share bits with the
-    arrow keys.
-The P2 layout was picked by an exhaustive search over ~13 million key
-assignments, then by comfort. Holding several keys never loses a real
-press in this model; only phantom presses are possible, and with these
-layouts they never change what the game does.
+calculator can read keys that are not pressed. The number keys share
+bits with the arrow keys (1, 2, 3 and + with LEFT; 5 and - with RIGHT),
+so with this layout some combinations DO produce phantom keys. I
+simulated every realistic situation: each player holding nothing / left
+/ right, with or without jump, plus nothing / shoot / slide / supershot,
+both players at the same time (24 x 24 = 576 combinations), and ran the
+game's own key decoder on the "ghosted" keypad state:
+    phantom keys appear in 209 of the 576 combinations;
+    0 of the 576 change what the game does (no phantom CLEAR or panic key
+    either).
+How: the extra keys that appear are mostly ones the game does not use
+(4, 6 ...). The one that matters is a phantom opposite arrow for player 1
+when player 2 holds 5 and 2 together. The decoder handles that: when it
+reads LEFT and RIGHT at once, it keeps the direction that was already
+held.
+What is still possible: if player 2 is ALREADY holding 5 and 2 together
+and player 1 only then presses Left or Right, player 1 does not start
+running until player 2 lets go of one of them. Holding 5 and 2 together
+is useless anyway (jump wins over slide), so just don't.
 
 
 3. HOW TO PLAY
@@ -125,8 +133,8 @@ knocks him over, but a well-timed kick clears it.
 Match: two halves of 30 seconds. The big number at the top counts down
 the seconds left in the half; it flashes red and pulses in the last 5
 seconds. A level score at full time goes to GOLDEN GOAL (the clock shows
-GG). After a goal: screen shake, a GOAL! banner, confetti, the crowd jumps,
-then the ball drops on the side of the team that conceded.
+GG). After a goal: a GOAL! banner, confetti, the crowd waves wildly, then
+the ball drops on the side of the team that conceded.
 
 Modes
   QUICK MATCH   pick a legend, play the computer.
@@ -177,24 +185,40 @@ saves are ignored (records start again).
     library (setjmp/longjmp for the panic exit). No floating point:
     physics is integer fixed point (1 pixel = 64 units); products that can
     exceed 24 bits are done in long.
-  - Fixed 30 Hz timestep from clock(); up to 3 physics steps run if a
-    frame is late, so game speed never depends on drawing speed.
-  - Double buffered. The stadium is drawn procedurally (no 76.8 KB
-    picture): roof arch per row, a cached 320x30 sky/roof strip, crowd
-    tiles (3 tiers x 2 frames, generated at start-up), perspective pitch
-    stripes merged into rectangles, pre-computed line pixels, platforms,
-    nets from a generated hex tile, soil. Each frame only the rectangles
-    that moving things covered two frames earlier are redrawn; the HUD
-    widgets are redrawn only when they change or something passes over
-    them. The two legends' heads and the ball are pre-rendered into
-    sprites for each match.
+  - Physics and AI run on a fixed 30 Hz timestep from clock() (up to 3
+    steps catch up if a frame is late, so game speed never depends on
+    drawing speed). The screen is drawn twice per step: right after a step
+    (players and ball half-way between the last two positions) and half a
+    step later (newest positions). That gives 60 frames per second of
+    smooth movement while the physics stays exactly as tested; the screen
+    swap waits for the display, so the rate is capped by its refresh.
+  - Double buffered. Each frame only the rectangles that moving things
+    covered two frames earlier are restored, then things are drawn.
+  - Why version 2 lagged, and what version 3 changed:
+      * The stadium behind every moving thing was redrawn procedurally
+        (roof rows, crowd tiles, stripes, lines ...): dozens of graphx
+        calls per rectangle. Now the finished stadium is drawn once at
+        start-up and stored in a compact cache (16-pixel pieces, identical
+        pieces stored once: 897 pieces; 27 KB with spare room). Restoring a
+        rectangle is a few memcpy/memset calls per row.
+      * Screen shake redrew the whole screen for several frames: removed.
+      * The crowd "jump" redrew the whole stand every 4 ticks during goal
+        celebrations: the crowd now waves through palette animation only.
+      * READY / GOAL! / HALF TIME were redrawn every frame (text printed 5
+        times for the outline): now they are a HUD widget, redrawn only
+        when they change or something crosses them, with a 2-print shadow.
+      * Heads were 44x46 sprites even for normal size; now cropped (about
+        27x29). Frozen, clone and giant heads were drawn shape by shape
+        every frame; now they come from the cached sprites.
+      * Tighter dirty rectangles, no particles over the HUD (they forced a
+        whole widget redraw), the control panels no longer slide.
   - Crowd arms waving, flags, fire, the ready glow and menu highlights are
     animated by rewriting palette entries: no drawing at all.
-  - Static data (BSS): about 43 KB (limit about 69 KB).
-  - Game feel: hit-pause on big impacts, screen shake on goals and power
-    shots, ball squash/stretch and spin, landing squash, star sparks on
-    hard shots, flame trails on power shots, sliding panels and shutter
-    transitions in the menus.
+  - Static data (BSS): about 44 KB (the tiles and tables used to draw the
+    stadium at start-up share memory with the cache).
+  - Game feel: hit-pause on big impacts, ball squash/stretch and spin,
+    landing squash, star sparks on hard shots, flame trails on power
+    shots, sliding panels and shutter transitions in the menus.
 
 
 7. TESTING THAT WAS DONE, AND HONEST LIMITS
@@ -207,49 +231,51 @@ Done:
   - The same main.c compiled on a PC against stand-in headers with a fake
     framebuffer, AddressSanitizer + UndefinedBehaviorSanitizer, and the
     keypad ghosting rule applied to every simulated key scan:
-      * 180,000 frames of random key presses on every screen (both
-        players at once): no crash, no memory error, no undefined
-        behaviour;
-      * a check after EVERY match frame that the redrawn stadium is
-        pixel-identical to a freshly drawn one (about 2.2 million checks,
-        0 differences), plus checks for 24-bit overflow, text drawn off
-        the screen and NoClip calls outside the screen (all 0);
-      * AI-vs-AI matches (over 5,000 in the final test run, including
-        the balance runs): every match ends, golden goal always resolves, about 7
-        goals per 60 s match. The left side wins about 51.6%;
-      * the ball never stays stuck on a platform, ramp or crossbar (a
-        "resting for more than 2 s next to a platform" detector reported
-        0 in the final runs);
+      * about 250,000 frames of random key presses on every screen (both
+        players at once, pausing, restarting, quitting): no crash, no
+        memory error, no undefined behaviour;
+      * at start-up, the cached stadium is compared with the procedurally
+        drawn one: identical;
+      * a check after EVERY match frame that the restored stadium is
+        pixel-identical to the original (about 5 million checks in the
+        final run, 0 differences), plus checks for 24-bit overflow, text
+        drawn off the screen and NoClip calls outside the screen (all 0);
+      * AI-vs-AI matches (over 4,500 in the final run): every match ends,
+        golden goal always resolves, the ball never stays stuck on a
+        platform, ramp or crossbar;
       * ability balance: every ordered pair of the 10 legends, 50 matches
-        each (4,500 matches). Overall win rates 45.7% (Magnet) to 54.6%
-        (Heavy Ball); every pairing between 36% and 64%. No ability wins
-        a match by itself;
-      * Hard vs Normal: Hard won 557 of 800 matches (from either side);
+        each (4,500 matches). Overall win rates 43.7% (Speed Boost) to
+        55.6% (Heavy Ball); every pairing between 35% and 65%;
+      * Hard vs Normal: Hard won 566 of 800 matches (from either side);
       * 6 cups (wins and knock-outs), leaving a cup, quitting the
         program and continuing the saved cup;
       * 2-player matches and best-of series with both players mashing
         their keys (keypad ghosting simulated on every scan);
-      * the ghosting check described in section 2 (0 of 576 wrong);
-      * the panic exit typed on 12 different screens (title, team
-        select, 1-player match, pause, results, cup bracket, records,
-        controls, 2-player menu, 2-player match, series and message
-        screens): it quit in the same key scan every time, called
-        gfx_End() and wrote nothing;
+      * the ghosting check described in section 2;
+      * the panic exit typed on 12 different screens: it quit in the same
+        key scan every time, called gfx_End() and wrote nothing;
       * screenshots of every screen and every ability, checked by eye.
-    Estimated drawing cost (see Limits): about 0.5 million cycles per
-    match frame on average, worst about 1.7 million; 0.02% of frames
-    were estimated above the 1.6 million available at 30 FPS.
+  - Speed. The harness counts the drawing work of every match frame
+    (graphx calls, rows, pixels filled, sprite pixels, characters,
+    memcpy/memset calls and bytes) and converts it with a deliberately
+    pessimistic eZ80 cost model, plus 200,000 cycles for the physics/AI
+    step on frames that follow one. Result (ESTIMATE):
+      version 2: about 0.9 million cycles of drawing per frame on
+                 average, so 30 FPS or less with frequent drops (the lag
+                 you saw);
+      version 3: about 0.4 million cycles per frame on average including
+                 the game logic, against 0.8 million available for 60 FPS
+                 at 48 MHz. About 1% of frames are estimated above that
+                 budget (mostly the first frames of the GOAL! banner and
+                 the start of a match); those show for 1/30 s instead of
+                 1/60 s.
 Limits:
   - It has NOT been run on a real calculator or an emulator (no ROM was
-    available), so the frame rate was NOT measured. The harness counts
-    the drawing work of every match frame (graphx calls, pixels filled,
-    sprite pixels, text) and converts it with a deliberately pessimistic
-    cost model; that ESTIMATE is given above. It suggests 30 FPS with
-    headroom, but treat it as an estimate.
+    available), so the frame rate was NOT measured. The numbers above are
+    estimates from counted work. Please tell me how it feels on your
+    calculator.
   - The calculator has no speaker: the "beep" in the last 5 seconds is a
     flash and pulse of the clock.
   - Text uses the built-in 8x8 font; big numbers use drawn segments.
-  - "Fade out" of the control panels is a slide up (8-bit palette mode has
-    no transparency).
   - The keypad ghosting model is the standard diode-less matrix rule; real
     hardware was not available to confirm it.

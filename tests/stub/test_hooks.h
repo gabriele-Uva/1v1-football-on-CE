@@ -22,6 +22,14 @@ void test_force_teams(int *t0, int *t1);
 void test_on_series(uint8_t w0, uint8_t w1, uint8_t need);
 void test_on_panic(void);
 void test_match_frame(void);
+void test_phase(int k);
+void test_logic_frame(void);
+void test_wcost(int w);
+void test_rows(int n);
+void test_memop(int bytes);
+void test_bg_proc(void);
+void test_bg_decoded(unsigned n);
+void test_bgc_full(void);
 void test_set_widget(uint8_t w, int x0, int y0, int x1, int y1);
-void fbl_test_decode(const uint8_t *k, const uint8_t *pk, uint8_t who, uint8_t *out6);
+void fbl_test_decode(const uint8_t *k, const uint8_t *pk, uint8_t who, int8_t dir, uint8_t *out6);
 #endif

@@ -62,6 +62,7 @@ void test_chk24(long v, int line)
 static int wr[8][4], nwr;
 void test_set_widget(uint8_t w, int x0, int y0, int x1, int y1)
 {
+    if (getenv("WDBG") && w == 6) fprintf(stderr, "frame %ld: W_OVL rect %d,%d,%d,%d\n", frames, x0, y0, x1, y1);
     if (w < 8) { wr[w][0] = x0; wr[w][1] = y0; wr[w][2] = x1; wr[w][3] = y1; if (w + 1 > nwr) nwr = w + 1; }
 }
 static int in_widget(int x, int y)
@@ -87,7 +88,7 @@ static void panic_keys(void)
 void test_screen(int id)
 {
     if (id == cur_screen) stable++;
-    else stable = 0;
+    else { stable = 0; if (getenv("WDBG")) fprintf(stderr, "frame %ld: screen %d\n", frames, id); }
     cur_screen = id;
 }
 
@@ -123,10 +124,45 @@ static void shot_later(const char *name, int delay)
 static double frame_cycles(void)
 {
     return cost.calls * 350.0 + cost.rows * 60.0 + cost.fill_px * 3.0 + cost.sprite_px * 4.0 +
-           cost.slow_px * 40.0 + cost.text_px * 30.0 + cost.chars * 800.0 + cost.direct * 2.0 + 150000.0;
+           cost.slow_px * 40.0 + cost.text_px * 30.0 + cost.chars * 800.0 + cost.direct * 2.0 +
+           cost.memops * 100.0 + cost.mem_bytes * 2.0 + 150000.0;
 }
 
-static int match_frame_flag;
+static double csum[NCOST];
+/* realistic (pessimistic) eZ80 cost of the drawing work counted in c */
+static double real_cycles(const cost_t *c)
+{
+    return c->calls * 800.0 + c->rows * 100.0 + c->fill_px * 6.0 + c->sprite_px * 20.0 +
+           c->slow_px * 60.0 + c->text_px * 30.0 + c->chars * 3000.0 + c->direct * 8.0 +
+           c->memops * 200.0 + c->mem_bytes * 4.0;
+}
+static cost_t ph_last, wc_last;
+static double wc_sum[8], wc_max[8];
+static long wc_n[8];
+void test_wcost(int w)
+{
+    cost_t d;
+    long *a = (long *)&d, *x = (long *)&cost, *y = (long *)&wc_last;
+    int q;
+    if (w == 0xFF) { wc_last = cost; return; }
+    for (q = 0; q < NCOST; q++) a[q] = x[q] - y[q];
+    { double r = real_cycles(&d); wc_sum[w] += r; wc_n[w]++; if (r > wc_max[w]) wc_max[w] = r; }
+}
+static double ph_sum[8], ph_max[8], ph_cur[8];
+static long ph_n;
+void test_phase(int k)
+{
+    cost_t d;
+    long *a = (long *)&d, *x = (long *)&cost, *y = (long *)&ph_last;
+    int q;
+    for (q = 0; q < NCOST; q++) a[q] = x[q] - y[q];
+    ph_last = cost;
+    if (k == 0) { ph_n++; return; }
+    { double r = real_cycles(&d); ph_sum[k] += r; ph_cur[k] = r; if (r > ph_max[k]) ph_max[k] = r; }
+}
+static int match_frame_flag, logic_flag;
+static double rc_sum, rc_max; static long rc_hist[20], rc_over;
+void test_logic_frame(void) { logic_flag = 1; }
 void test_match_frame(void) { match_frame_flag = 1; }
 void stub_on_swap(void)
 {
@@ -137,15 +173,32 @@ void stub_on_swap(void)
         int b = (int)(c / 100000.0);
         match_frames++;
         cyc_sum += c; cyc_n++;
+        { int q; long *src = (long *)&cost; for (q = 0; q < NCOST; q++) csum[q] += src[q]; }
         if (c > cyc_max) cyc_max = c;
         if (c > 1600000.0) over_budget++;
         hist[b > 19 ? 19 : b]++;
+        {
+            /* realistic: drawing + one physics/AI tick (est. 200k) on the frame after a tick */
+            double r = real_cycles(&cost) + (logic_flag ? 200000.0 : 0.0) + 30000.0;
+            int rb = (int)(r / 100000.0);
+            rc_sum += r;
+            if (r > rc_max) rc_max = r;
+            if (r > 800000.0) {
+                rc_over++;
+                if (getenv("REALDBG"))
+                    fprintf(stderr, "heavy %.0f logic=%d restore=%.0f players=%.0f ball=%.0f parts=%.0f widgets=%.0f memops=%ld rows=%ld\n",
+                            r, logic_flag, ph_cur[1], ph_cur[3], ph_cur[4], ph_cur[5], ph_cur[7], cost.memops, cost.rows);
+            }
+            rc_hist[rb > 19 ? 19 : rb]++;
+        }
         if (getenv("COSTDBG") && c > atof(getenv("COSTDBG")))
             fprintf(stderr, "heavy frame %ld: est %.0f calls=%ld rows=%ld fill=%ld spr=%ld slow=%ld textpx=%ld chars=%ld\n",
                     frames, c, cost.calls, cost.rows, cost.fill_px, cost.sprite_px, cost.slow_px, cost.text_px, cost.chars);
     }
     match_frame_flag = 0;
+    logic_flag = 0;
     memset(&cost, 0, sizeof cost);
+    memset(&ph_last, 0, sizeof ph_last);
     if (shot_pending && --shot_pending == 0) write_ppm(shot_name, scr_idx);
     if (getenv("MOVIE") && cur_screen == SCR_ID_MATCH) {
         static long mf;
@@ -165,9 +218,24 @@ void stub_on_swap(void)
 /* ---- pixel-exact check of the dirty-rectangle restore ---- */
 static uint8_t pristine[240][320];
 static int have_pristine;
+static uint8_t bg_proc[240][320];
+static long bgc_bad, bgc_entries, bgc_overflow;
+void test_rows(int n) { cost.rows += n; }
+void test_memop(int bytes) { cost.memops++; cost.mem_bytes += bytes; }
+void test_bg_proc(void) { memcpy(bg_proc, stub_draw_buffer(), sizeof bg_proc); }
+void test_bg_decoded(unsigned n)
+{
+    bgc_entries = (long)n;
+    if (memcmp(bg_proc, stub_draw_buffer(), sizeof bg_proc)) {
+        bgc_bad++;
+        fprintf(stderr, "BACKGROUND CACHE MISMATCH\n");
+    }
+}
+void test_bgc_full(void) { bgc_overflow++; }
 void test_bg_ready(uint8_t jump)
 {
     if (!jump) { memcpy(pristine, stub_draw_buffer(), sizeof pristine); have_pristine = 1; }
+    if (getenv("DUMPBG")) { FILE *f = fopen(getenv("DUMPBG"), "wb"); if (f) { fwrite(stub_draw_buffer(), 1, 76800, f); fclose(f); } }
 }
 void test_after_restore(uint8_t jump, int shaking)
 {
@@ -198,7 +266,7 @@ void test_on_goal(uint8_t scorer, uint8_t half, int half_ticks)
 {
     goals_side[scorer]++;
     if (half == 2) { golden_goals++; if (half_ticks > gg_ticks_max) gg_ticks_max = half_ticks; }
-    if (scenario == SC_SHOTS && !shots_taken[0]) { shots_taken[0] = 1; shot_later("09_goal", 10); }
+    if (scenario == SC_SHOTS && !shots_taken[0]) { shots_taken[0] = 1; shot_later("09_goal", 30); }
 }
 void test_on_super(uint8_t who, uint8_t power)
 {
@@ -282,14 +350,14 @@ static void random_hold(uint8_t *kb, int p2)
         if (rr() % 9 == 0) kb[7] |= kb_Up;
         if (rr() % 40 == 0) kb[7] |= kb_Down;
         if (rr() % 6 == 0) kb[1] |= kb_2nd;
-        if (rr() % 30 == 0) kb[2] |= kb_Alpha;
+        if (rr() % 30 == 0) kb[1] |= kb_Mode;
     } else {
-        if (hold_dir[i] < 0) kb[3] |= kb_Apps;
-        if (hold_dir[i] > 0) kb[5] |= kb_Vars;
-        if (rr() % 9 == 0) kb[4] |= kb_Stat;
-        if (rr() % 40 == 0) kb[4] |= kb_Prgm;
-        if (rr() % 6 == 0) kb[4] |= kb_LParen;
-        if (rr() % 30 == 0) kb[5] |= kb_RParen;
+        if (hold_dir[i] < 0) kb[3] |= kb_1;
+        if (hold_dir[i] > 0) kb[5] |= kb_3;
+        if (rr() % 9 == 0) kb[4] |= kb_5;
+        if (rr() % 40 == 0) kb[4] |= kb_2;
+        if (rr() % 6 == 0) kb[6] |= kb_Add;
+        if (rr() % 30 == 0) kb[6] |= kb_Sub;
     }
 }
 
@@ -432,9 +500,9 @@ static void script(uint8_t *kb)
         panic_script();
         return;
     case SC_FUZZ: {
-        static const uint8_t g[] = { 7, 7, 7, 7, 1, 2, 6, 6, 3, 4, 4, 5, 4, 5, 1 };
-        static const uint8_t m[] = { kb_Left, kb_Right, kb_Up, kb_Down, kb_2nd, kb_Alpha, kb_Enter,
-                                     kb_Clear, kb_Apps, kb_Stat, kb_Prgm, kb_Vars, kb_LParen, kb_RParen, kb_Del };
+        static const uint8_t g[] = { 7, 7, 7, 7, 1, 1, 6, 6, 3, 4, 4, 5, 6, 6, 1 };
+        static const uint8_t m[] = { kb_Left, kb_Right, kb_Up, kb_Down, kb_2nd, kb_Mode, kb_Enter,
+                                     kb_Clear, kb_1, kb_5, kb_2, kb_3, kb_Add, kb_Sub, kb_Del };
         int n = (int)(rr() % 4), k;
         if (cur_screen == SCR_ID_MATCH) { random_hold(kb, 0); random_hold(kb, 1); }
         for (k = 0; k < n; k++) {
@@ -457,7 +525,7 @@ static void script(uint8_t *kb)
         case 7:
             if (cur_screen == SCR_ID_MATCH) {
                 cur_match_ticks++;
-                if (cur_match_ticks == 20) shot_later("05_kickoff_help", 1);
+                if (cur_match_ticks == 12) shot_later("05_kickoff_help", 1);
                 if (cur_match_ticks == 260) shot_later("06_match", 1);
                 if (cur_match_ticks == 700) { TAP_CLEAR(); shots_stage++; }
             }
@@ -521,18 +589,21 @@ void stub_feed_keys(uint8_t *kb)
 /* ---- exhaustive ghosting check through the game's own decoder ---- */
 static int ghost_check(void)
 {
-    /* realistic per-player combos: direction x jump x one action */
-    static const uint8_t P1G[6] = { 7, 7, 7, 7, 1, 2 }, P1M[6] = { kb_Left, kb_Right, kb_Up, kb_Down, kb_2nd, kb_Alpha };
-    static const uint8_t P2G[6] = { 3, 5, 4, 4, 4, 5 }, P2M[6] = { kb_Apps, kb_Vars, kb_Stat, kb_Prgm, kb_LParen, kb_RParen };
+    /* realistic per-player combos: direction x jump x one action.
+       The direction is held from before (the decoder remembers it). */
+    static const uint8_t P1G[6] = { 7, 7, 7, 7, 1, 1 }, P1M[6] = { kb_Left, kb_Right, kb_Up, kb_Down, kb_2nd, kb_Mode };
+    static const uint8_t P2G[6] = { 3, 5, 4, 4, 6, 6 }, P2M[6] = { kb_1, kb_3, kb_5, kb_2, kb_Add, kb_Sub };
     /* order in both tables: left, right, jump, slide, shoot, super */
-    int c1, c2, bad = 0, total = 0;
+    int c1, c2, bad = 0, raw = 0, total = 0;
     for (c1 = 0; c1 < 24; c1++) for (c2 = 0; c2 < 24; c2++) {
         uint8_t kb[8] = { 0 }, gk[8], none[8] = { 0 };
         uint8_t want[2][6], got[2][6];
-        int who;
+        int8_t dir[2];
+        int who, k;
         for (who = 0; who < 2; who++) {
             int c = who ? c2 : c1, d = c / 8, j = (c / 4) & 1, a = c & 3;
             const uint8_t *G = who ? P2G : P1G, *Mk = who ? P2M : P1M;
+            dir[who] = (int8_t)(d == 1 ? -1 : d == 2 ? 1 : 0);
             if (d == 1) kb[G[0]] |= Mk[0];
             if (d == 2) kb[G[1]] |= Mk[1];
             if (j) kb[G[2]] |= Mk[2];
@@ -540,9 +611,10 @@ static int ghost_check(void)
         }
         memcpy(gk, kb, 8);
         stub_ghost(gk);
+        for (k = 0; k < 8; k++) if (gk[k] != kb[k]) { raw++; break; }
         for (who = 0; who < 2; who++) {
-            fbl_test_decode(kb, none, (uint8_t)who, want[who]);
-            fbl_test_decode(gk, none, (uint8_t)who, got[who]);
+            fbl_test_decode(kb, none, (uint8_t)who, dir[who], want[who]);
+            fbl_test_decode(gk, none, (uint8_t)who, dir[who], got[who]);
         }
         total++;
         if (memcmp(want, got, sizeof want) || (gk[6] & kb_Clear) || (gk[1] & 0x1F)) {
@@ -550,32 +622,8 @@ static int ghost_check(void)
             if (bad < 5) fprintf(stderr, "ghost problem: P1 combo %d, P2 combo %d\n", c1, c2);
         }
     }
-    printf("ghost check: %d of %d realistic two-player key combinations decode wrongly (incl. phantom CLEAR/panic keys)\n", bad, total);
-    /* the number pad layout suggested in the brief, for comparison */
-    {
-        static const uint8_t NG[6] = { 3, 5, 4, 4, 3, 3 }, NM[6] = { kb_4, (1 << 2), (1 << 3), (1 << 2), kb_1, kb_0 };
-        int nb = 0;
-        for (c1 = 0; c1 < 24; c1++) for (c2 = 0; c2 < 24; c2++) {
-            uint8_t kb[8] = { 0 }, gk[8];
-            int who, k, diff = 0;
-            for (who = 0; who < 2; who++) {
-                int c = who ? c2 : c1, d = c / 8, j = (c / 4) & 1, a = c & 3;
-                const uint8_t *G = who ? NG : P1G, *Mk = who ? NM : P1M;
-                if (d == 1) kb[G[0]] |= Mk[0];
-                if (d == 2) kb[G[1]] |= Mk[1];
-                if (j) kb[G[2]] |= Mk[2];
-                if (a) kb[G[2 + a]] |= Mk[2 + a];
-            }
-            memcpy(gk, kb, 8);
-            stub_ghost(gk);
-            for (k = 0; k < 6; k++) {
-                if (((gk[P1G[k]] & P1M[k]) != 0) != ((kb[P1G[k]] & P1M[k]) != 0)) diff = 1;
-                if (((gk[NG[k]] & NM[k]) != 0) != ((kb[NG[k]] & NM[k]) != 0)) diff = 1;
-            }
-            nb += diff;
-        }
-        printf("for comparison, a number-pad P2 layout (4 6 8 5 1 0) gives phantom presses in %d of 576\n", nb);
-    }
+    printf("ghost check: phantom keys appear in %d of %d realistic two-player combinations; "
+           "%d of %d change what the game does (incl. phantom CLEAR/panic keys)\n", raw, total, bad, total);
     return bad;
 }
 
@@ -651,14 +699,33 @@ int main(int argc, char **argv)
     { int t; for (t = 0; t < NTEAMS; t++) printf(" %s=%ld", PNAME[t], supers_by_power[t]); }
     printf("\ntours=%ld champs=%ld out_by_round=%ld/%ld/%ld loads=%ld load_active=%ld series_done=%ld\n",
            tours, champs, out_round[0], out_round[1], out_round[2], loads, load_active, series_done);
+    printf("background cache: %ld dictionary chunks (max 1100), decode mismatches=%ld, overflows=%ld\n",
+           bgc_entries, bgc_bad, bgc_overflow);
     printf("restore pixel checks=%ld mismatches=%ld  24bit overflows=%ld  violations=%ld  text overflow=%ld  stuck=%ld\n",
            pix_checks, pix_mismatch, chk24_fail, violations, text_overflow, stuck_matches);
     if (cyc_n) {
         int b;
         printf("EST. cycles/frame avg=%.0f max=%.0f (budget 1.6M @30fps) frames over budget=%ld\n",
                cyc_sum / cyc_n, cyc_max, over_budget);
+        printf("avg per match frame: calls=%.0f fill_px=%.0f rows=%.0f sprite_px=%.0f slow_px=%.0f text_px=%.0f chars=%.1f direct=%.0f memops=%.0f mem_bytes=%.0f\n",
+               csum[0] / cyc_n, csum[1] / cyc_n, csum[2] / cyc_n, csum[3] / cyc_n, csum[4] / cyc_n, csum[5] / cyc_n, csum[6] / cyc_n, csum[7] / cyc_n,
+               csum[8] / cyc_n, csum[9] / cyc_n);
+        if (ph_n) {
+            static const char *PN[8] = { "", "restore", "shadows", "players", "wall+ball", "particles", "overlays", "widgets" };
+            int q;
+            printf("REALISTIC drawing cost by phase (avg/max cycles):");
+            for (q = 1; q < 8; q++) printf(" %s=%.0f/%.0f", PN[q], ph_sum[q] / ph_n, ph_max[q]);
+            printf("\nwidget redraws (count, avg, max cycles):");
+            for (q = 0; q < 7; q++) printf(" w%d=%ld/%.0f/%.0f", q, wc_n[q], wc_n[q] ? wc_sum[q] / wc_n[q] : 0.0, wc_max[q]);
+            printf("\n");
+        }
         printf("cost histogram (100k-cycle buckets):");
         for (b = 0; b < 20; b++) if (hist[b]) printf(" %d00k:%ld", b, hist[b]);
+        printf("\n");
+        printf("REALISTIC frame cost (drawing + logic): avg=%.0f max=%.0f; frames over the 60 FPS budget (800k): %ld of %ld (%.3f%%)\n",
+               rc_sum / cyc_n, rc_max, rc_over, cyc_n, 100.0 * rc_over / cyc_n);
+        printf("REALISTIC histogram (100k buckets):");
+        for (b = 0; b < 20; b++) if (rc_hist[b]) printf(" %d00k:%ld", b, rc_hist[b]);
         printf("\n");
     }
     if (scenario == SC_BALANCE) {
@@ -681,5 +748,5 @@ int main(int argc, char **argv)
         }
     }
     printf("save var size=%zu archived=%d\n", stub_var_size("FBLGSAVE"), stub_var_archived("FBLGSAVE"));
-    return (fail || pix_mismatch || chk24_fail || violations || text_overflow || stuck_matches) ? 1 : 0;
+    return (fail || bgc_bad || bgc_overflow || pix_mismatch || chk24_fail || violations || text_overflow || stuck_matches) ? 1 : 0;
 }

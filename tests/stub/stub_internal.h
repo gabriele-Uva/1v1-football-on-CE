@@ -4,8 +4,9 @@
 #include <stddef.h>
 
 typedef struct {
-    long calls, fill_px, rows, sprite_px, slow_px, text_px, chars, direct;
+    long calls, fill_px, rows, sprite_px, slow_px, text_px, chars, direct, memops, mem_bytes;
 } cost_t;
+#define NCOST 10
 
 extern uint8_t vram[2][240][320];
 extern uint16_t stub_pal[256];

@@ -5,6 +5,9 @@ A 2D side-view "head soccer" game for the **TI-84 Plus CE**, written in C for th
 Football Legends: stadium with roof and crowd, goals on raised platforms, 10 legends with
 unique abilities, 1-player and 2-player modes.
 
+Version 3: up to 60 FPS (background cache, interpolated in-between frames), player 1
+supershot on MODE, player 2 on the number keys (1 3 run, 5 jump, 2 slide, + shoot, - supershot).
+
 | Path | What |
 |---|---|
 | `FBLEGEND/src/main.c` | the whole game |

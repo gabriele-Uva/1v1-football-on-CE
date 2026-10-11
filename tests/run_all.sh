@@ -22,5 +22,5 @@ P1DIFF=1 NOSWITCH=1 ./harness_fast aivai 400 41 > "$OUT/hard_left.txt" 2>&1
 P1DIFF=0 HARD=1 ./harness_fast aivai 400 44 > "$OUT/hard_right.txt" 2>&1
 for f in "$OUT"/*.txt; do
   echo "=== $(basename "$f" .txt)"
-  grep -v "^WATCH\|^panic target" "$f" | grep "ghost check\|number-pad\|panic exits\|scenario=\|matches=\|avg match\|rests\|tours=\|restore pixel\|EST\.\|exit=\|ERROR\|FAILED"
+  grep -v "^WATCH\|^panic target" "$f" | grep "ghost check\|panic exits\|scenario=\|matches=\|avg match\|rests\|tours=\|restore pixel\|background cache\|REALISTIC frame\|exit=\|ERROR\|FAILED\|MISMATCH"
 done

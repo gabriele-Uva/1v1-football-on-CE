@@ -75,6 +75,7 @@
 #define FP 64
 #define PX(v) (((v) + 32) >> 6)   /* rounded, so mirrored positions match */
 #define TICK_HZ 30
+#define TICK_CLK 1092     /* 32768 Hz clock units per tick (and 8/30 more) */
 #define HALF_TICKS (30 * TICK_HZ)
 
 #define BALL_R 6
@@ -355,15 +356,6 @@ static uint8_t keys[8], prev_keys[8];
 static uint32_t rng_s = 0x2545F491UL;
 static jmp_buf panic_env;
 
-/* sprites generated at start-up */
-static uint8_t crowd_buf[CROWD_TIERS * 2][2 + CROWD_W * CROWD_H];
-static uint8_t ad_buf[5][2 + AD_W * AD_H];
-static uint8_t net_buf[2 + NET_W * NET_H];
-/* cached sky + roof strip (rows 0..29), two 160-wide halves */
-#define ROOF_CACHE_H 30
-static uint8_t roof_buf[2][2 + 160 * ROOF_CACHE_H];
-#define ROOF_SPR(i) ((gfx_sprite_t *)(void *)roof_buf[i])
-static bool roof_cached;
 /* pre-rendered heads of the two legends in the match, both directions */
 #define HEAD_SW 44
 #define HEAD_SH 46
@@ -372,27 +364,62 @@ static bool roof_cached;
 static uint8_t head_buf[2][2][2 + HEAD_SW * HEAD_SH];
 #define HEAD_SPR(s, d) ((gfx_sprite_t *)(void *)head_buf[s][d])
 static int8_t head_team[2] = { -1, -1 };
+/* scratch head sprite (tinted copies) and a cached giant-size head */
+static uint8_t head_tmp[2 + HEAD_SW * HEAD_SH];
+static uint8_t giant_buf[2 + HEAD_SW * HEAD_SH];
+static int8_t giant_key = -1;      /* team * 2 + direction, -1 = none */
 /* pre-rendered ball, 8 spin frames */
 #define BALL_SW 13
 static uint8_t ballspr_buf[8][2 + BALL_SW * BALL_SW];
 #define BALL_SPR(f) ((gfx_sprite_t *)(void *)ballspr_buf[f])
-#define CROWD_SPR(i) ((gfx_sprite_t *)(void *)crowd_buf[i])
-#define AD_SPR(i) ((gfx_sprite_t *)(void *)ad_buf[i])
-#define NET_SPR ((gfx_sprite_t *)(void *)net_buf)
-static uint8_t crowd_jump;  /* 0 normal, 1 = jumping frame */
+#define CROWD_SPR(i) ((gfx_sprite_t *)(void *)bgc.gen.crowd[i])
+#define AD_SPR(i) ((gfx_sprite_t *)(void *)bgc.gen.ad[i])
+#define NET_SPR ((gfx_sprite_t *)(void *)bgc.gen.net)
 
 /* pre-computed background tables */
 static int16_t roof_out[ROOF_ROWS], roof_in[ROOF_ROWS];   /* half-widths per row */
 #define PITCH_ROWS (PITCH_Y1 - PITCH_Y0)
 #define STRIPES 12
-static int16_t stripe_x[PITCH_ROWS][STRIPES + 1];
 /* slanted lines, ellipses: pixels bucketed by row */
 #define LINE_Y0 90
 #define LINE_ROWS (PITCH_Y1 - LINE_Y0)
 #define LINE_MAX 720
-static int16_t line_px[LINE_MAX];
-static uint8_t line_col[LINE_MAX];
-static uint16_t line_row[LINE_ROWS + 1];
+/* Background cache: the finished stadium in 16-pixel chunks. Each entry
+ * of bgc_idx is a chunk number in the dictionary, or BGC_SOLID | colour
+ * for a chunk of one colour. Restoring a rectangle is then a handful of
+ * memcpy / memset calls per row. The tiles and tables used to draw the
+ * stadium once at start-up share the dictionary's memory (they are not
+ * needed afterwards). */
+#define BGC_CH 16
+#define BGC_COLS (SCR_W / BGC_CH)
+#define BGC_MAX 1100
+#define BGC_SOLID 0xF000u
+#define BGC_HASH 2048
+static uint16_t bgc_idx[SCR_H][BGC_COLS];
+static union {
+    uint8_t dict[BGC_MAX][BGC_CH];
+    struct {
+        uint8_t crowd[CROWD_TIERS][2 + CROWD_W * CROWD_H];
+        uint8_t ad[5][2 + AD_W * AD_H];
+        uint8_t net[2 + NET_W * NET_H];
+        int16_t stripe_x[PITCH_ROWS][STRIPES + 1];   /* perspective stripes */
+        int16_t line_px[LINE_MAX];                   /* line pixels by row */
+        uint8_t line_col[LINE_MAX];
+        uint16_t line_row[LINE_ROWS + 1];
+        int16_t tmp_x[LINE_MAX];
+        uint8_t tmp_y[LINE_MAX], tmp_c[LINE_MAX];
+    } gen;
+} bgc;
+static uint16_t bgc_n;
+static bool bgc_ready;
+#define stripe_x (bgc.gen.stripe_x)
+#define line_px (bgc.gen.line_px)
+#define line_col (bgc.gen.line_col)
+#define line_row (bgc.gen.line_row)
+#define tmp_x (bgc.gen.tmp_x)
+#define tmp_y (bgc.gen.tmp_y)
+#define tmp_c (bgc.gen.tmp_c)
+
 /* ability icon ring */
 #define RING_N 64
 static int8_t ring_x[RING_N], ring_y[RING_N];
@@ -410,7 +437,7 @@ static int shake_x, shake_y;     /* current background offset */
 static uint8_t full_pending;     /* full redraws still needed after a shake */
 
 /* HUD widgets, redrawn only when needed */
-enum { W_CLOCK, W_SCORE, W_ICON0, W_ICON1, W_HELP0, W_HELP1, W_COUNT };
+enum { W_CLOCK, W_SCORE, W_ICON0, W_ICON1, W_HELP0, W_HELP1, W_OVL, W_COUNT };
 static rect_t wrect[W_COUNT];
 static uint16_t wver[W_COUNT];
 static uint16_t wdrawn[2][W_COUNT];
@@ -559,13 +586,11 @@ static bool key_back(void)
     return KPRESS(6, kb_Clear);
 }
 
-/* Player 1: arrows, 2nd, alpha.
- * Player 2: STAT jump, APPS / PRGM / VARS = left / slide / right,
- * ( shoot, ) supershot.
- * Chosen by an exhaustive search of the keypad matrix: no realistic
- * combination of both players' keys can make a phantom press (see README).
- * Jump wins over slide. */
-static void decode_ctrl(const uint8_t *k, const uint8_t *pk, uint8_t who, ctrl_t *c)
+/* Player 1: arrows, 2nd shoot, MODE supershot.
+ * Player 2: 1 / 3 run, 5 jump, 2 slide, + shoot, - supershot.
+ * *dir remembers the direction last held alone (-1, 0, 1). Jump wins
+ * over slide. */
+static void decode_ctrl(const uint8_t *k, const uint8_t *pk, uint8_t who, ctrl_t *c, int8_t *dir)
 {
 #define KD(g, m) ((k[g] & (m)) != 0)
 #define KP(g, m) ((k[g] & (m)) && !(pk[g] & (m)))
@@ -575,32 +600,42 @@ static void decode_ctrl(const uint8_t *k, const uint8_t *pk, uint8_t who, ctrl_t
         c->jump = KD(7, kb_Up);
         c->slide = KP(7, kb_Down);
         c->shoot = KP(1, kb_2nd);
-        c->super = KP(2, kb_Alpha);
+        c->super = KP(1, kb_Mode);
     } else {
-        c->left = KD(3, kb_Apps);
-        c->right = KD(5, kb_Vars);
-        c->jump = KD(4, kb_Stat);
-        c->slide = KP(4, kb_Prgm);
-        c->shoot = KP(4, kb_LParen);
-        c->super = KP(5, kb_RParen);
+        c->left = KD(3, kb_1);
+        c->right = KD(5, kb_3);
+        c->jump = KD(4, kb_5);
+        c->slide = KP(4, kb_2);
+        c->shoot = KP(6, kb_Add);
+        c->super = KP(6, kb_Sub);
     }
 #undef KD
 #undef KP
-    if (c->left && c->right) c->left = c->right = false;
+    /* Both directions read at once: keep the one that was already held.
+       This also hides the phantom opposite arrow that the keypad matrix
+       produces when P2 holds 5 and 2 together (see README). */
+    if (c->left && c->right) {
+        c->left = *dir < 0;
+        c->right = *dir > 0;
+    } else {
+        *dir = c->left ? -1 : c->right ? 1 : 0;
+    }
     if (c->jump) c->slide = false;
 }
 
+static int8_t held_dir[2];
+
 static void human_ctrl(uint8_t who, ctrl_t *c)
 {
-    decode_ctrl(keys, prev_keys, who, c);
+    decode_ctrl(keys, prev_keys, who, c, &held_dir[who]);
 }
 
 #ifdef FBL_HOST_TEST
 /* lets the harness check the real decoder against simulated ghosting */
-void fbl_test_decode(const uint8_t *k, const uint8_t *pk, uint8_t who, uint8_t *out6)
+void fbl_test_decode(const uint8_t *k, const uint8_t *pk, uint8_t who, int8_t dir, uint8_t *out6)
 {
     ctrl_t c;
-    decode_ctrl(k, pk, who, &c);
+    decode_ctrl(k, pk, who, &c, &dir);
     out6[0] = c.left; out6[1] = c.right; out6[2] = c.jump;
     out6[3] = c.slide; out6[4] = c.shoot; out6[5] = c.super;
 }
@@ -617,7 +652,7 @@ static void tick_reset(void)
 
 static void tick_advance(void)
 {
-    next_tick += 1092;
+    next_tick += TICK_CLK;
     tick_frac += 8;
     if (tick_frac >= 30) {
         tick_frac -= 30;
@@ -866,12 +901,10 @@ static void txt_sh(const char *s, int x, int y, uint8_t c, uint8_t sc)
 /* big outlined text, like the clock in the browser game */
 static void txt_outline(const char *s, int x, int y, uint8_t c, uint8_t sc)
 {
+    /* drop shadow: two prints instead of a five-print outline (much faster) */
     gfx_SetTextScale(sc, sc);
     gfx_SetTextFGColor(C_PANEL);
-    gfx_PrintStringXY(s, x - 1, y);
-    gfx_PrintStringXY(s, x + 1, y);
-    gfx_PrintStringXY(s, x, y - 1);
-    gfx_PrintStringXY(s, x, y + 2);
+    gfx_PrintStringXY(s, x + sc, y + sc);
     gfx_SetTextFGColor(c);
     gfx_PrintStringXY(s, x, y);
     gfx_SetTextScale(1, 1);
@@ -1013,8 +1046,6 @@ static hspan_t hspan[HSPANS];
 static int pscale(int row) { return 210 + 46 * row / (PITCH_ROWS - 1); }
 static int pitch_x(int wx, int y) { return 160 + (int)((long)(wx - 160) * pscale(y - PITCH_Y0) / 256); }
 
-static int16_t tmp_x[LINE_MAX];
-static uint8_t tmp_y[LINE_MAX], tmp_c[LINE_MAX];
 static int ntmp;
 
 static void lp_add(int x, int y, uint8_t c)
@@ -1122,11 +1153,12 @@ static const uint8_t FAN_SHIRTS[12] = {
     K_RED, K_BLUE, K_YEL, K_WHITE, K_ORA, K_SKY, K_GRN, K_PINK, K_AZU, K_GOLD, K_PURP, K_LIME
 };
 
-static void gen_crowd(uint8_t tier, bool jump)
+static void gen_crowd(uint8_t tier)
 {
+    const bool jump = false;
     uint32_t saved = rng_s;
     uint8_t band, k;
-    gfx_sprite_t *spr = CROWD_SPR(tier * 2 + (jump ? 1 : 0));
+    gfx_sprite_t *spr = CROWD_SPR(tier);
     rng_s = 0x9E3779B9UL + tier * 7919UL;
     gfx_SetClipRegion(0, 0, CROWD_W, CROWD_H);
     for (band = 0; band < 2; band++) {
@@ -1199,8 +1231,8 @@ static void gen_net(void)
 {
     static const int8_t CX[5] = { 0, 12, 6, 0, 12 }, CY[5] = { 0, 0, 4, 8, 8 };
     int x, y, k;
-    net_buf[0] = NET_W;
-    net_buf[1] = NET_H;
+    bgc.gen.net[0] = NET_W;
+    bgc.gen.net[1] = NET_H;
     for (y = 0; y < NET_H; y++) {
         for (x = 0; x < NET_W; x++) {
             int d1 = 9999, d2 = 9999;
@@ -1209,18 +1241,17 @@ static void gen_net(void)
                 int d = dx * dx + dy * dy;
                 if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) d2 = d;
             }
-            net_buf[2 + y * NET_W + x] = (uint8_t)(d2 - d1 <= 9 ? ((x + y) & 3 ? C_NET : C_NET + 1) : C_TRANSP);
+            bgc.gen.net[2 + y * NET_W + x] = (uint8_t)(d2 - d1 <= 9 ? ((x + y) & 3 ? C_NET : C_NET + 1) : C_TRANSP);
         }
     }
 }
 
+static void bgc_build(void);
+
 static void gen_assets(void)
 {
     uint8_t t;
-    for (t = 0; t < CROWD_TIERS; t++) {
-        gen_crowd(t, false);
-        gen_crowd(t, true);
-    }
+    for (t = 0; t < CROWD_TIERS; t++) gen_crowd(t);
     gen_ad(0, "CE CUP", C_AD + 3);
     gen_ad(1, "GRAPHX", C_AD + 2);
     gen_ad(2, "LEGENDS", C_AD + 3);
@@ -1228,19 +1259,7 @@ static void gen_assets(void)
     gen_ad(4, "EZ80", C_AD + 3);
     gen_net();
     gen_tables();
-    /* draw the top strip once and keep it as two sprites */
-    shake_x = shake_y = 0;
-    roof_cached = false;
-    rx0 = 0; ry0 = 0; rx1 = SCR_W; ry1 = ROOF_CACHE_H;
-    gfx_SetClipRegion(0, 0, SCR_W, ROOF_CACHE_H);
-    roof_draw(0, ROOF_CACHE_H);
-    for (t = 0; t < 2; t++) {
-        ROOF_SPR(t)->width = 160;
-        ROOF_SPR(t)->height = ROOF_CACHE_H;
-        gfx_GetSprite(ROOF_SPR(t), t * 160, 0);
-    }
-    gfx_SetClipRegion(0, 0, SCR_W, SCR_H);
-    roof_cached = true;
+    bgc_build();
 }
 
 /* --- stadium pieces --- */
@@ -1350,7 +1369,7 @@ static void bg_draw(int x0, int y0, int x1, int y1)
         for (t = 0; t < CROWD_TIERS; t++) {
             int ty = STAND_Y0 + t * CROWD_H;
             if (!rhit(0, ty, SCR_W, ty + CROWD_H)) continue;
-            for (k = 0; k < 6; k++) rsprite(CROWD_SPR(t * 2 + crowd_jump), -OFF[t] + k * CROWD_W, ty);
+            for (k = 0; k < 6; k++) rsprite(CROWD_SPR(t), -OFF[t] + k * CROWD_W, ty);
         }
         rfill(0, STAND_Y0 + CROWD_H - 1, SCR_W, STAND_Y0 + CROWD_H, C_SEAT + 3);
         rfill(0, STAND_Y0 + 2 * CROWD_H - 1, SCR_W, STAND_Y0 + 2 * CROWD_H, C_SEAT + 3);
@@ -1361,12 +1380,8 @@ static void bg_draw(int x0, int y0, int x1, int y1)
         rfill(146, 89, 174, 102, C_TUNNEL + 2);
         rfill(148, 87, 172, 89, C_TUNNEL + 2);
     }
-    /* sky, clouds, roof arch, back wall: rows 0..29 come from the cache */
-    if (roof_cached && rhit(0, 0, SCR_W, ROOF_CACHE_H)) {
-        rsprite(ROOF_SPR(0), 0, 0);
-        rsprite(ROOF_SPR(1), 160, 0);
-    }
-    roof_draw(roof_cached ? ROOF_CACHE_H : 0, ROOF_ROWS);
+    /* sky, clouds, roof arch, back wall */
+    roof_draw(0, ROOF_ROWS);
     /* ad boards and running track */
     if (rhit(0, AD_Y, SCR_W, PITCH_Y0)) {
         for (i = 0; i < 5; i++) rsprite(AD_SPR(i), i * AD_W, AD_Y);
@@ -1434,10 +1449,93 @@ static void bg_draw(int x0, int y0, int x1, int y1)
     if (shake_y < 0) rfill(0, SCR_H, SCR_W, SCR_H - shake_y, C_NAVY);
 }
 
+/* Copy screen rect (x0,y0)-(x1,y1) of the stadium from the cache into the
+ * back buffer. Neighbouring chunks that are stored next to each other (or
+ * share a colour) go in one memcpy / memset. */
+static void bgc_restore(int x0, int y0, int x1, int y1)
+{
+    uint8_t *row = &gfx_vbuffer[y0][0];
+    int y;
+    TEST_HOOK(test_rows(y1 - y0));
+    for (y = y0; y < y1; y++, row += SCR_W) {
+        const uint16_t *ix = bgc_idx[y];
+        int x = x0, xe;
+        uint8_t c = (uint8_t)(x0 / BGC_CH);
+        while (x < x1) {
+            uint16_t e = ix[c];
+            if (e >= BGC_SOLID) {
+                do { c++; xe = c * BGC_CH; } while (xe < x1 && ix[c] == e);
+                if (xe > x1) xe = x1;
+                memset(row + x, (uint8_t)e, (size_t)(xe - x));
+            } else {
+                const uint8_t *src = &bgc.dict[e][x % BGC_CH];
+                do { c++; e++; xe = c * BGC_CH; } while (xe < x1 && ix[c] == e);
+                if (xe > x1) xe = x1;
+                memcpy(row + x, src, (size_t)(xe - x));
+            }
+            TEST_HOOK(test_memop(xe - x));
+            x = xe;
+        }
+    }
+}
+
+/* Draw the stadium once (procedurally) and store it in the cache. */
+static void bgc_build(void)
+{
+    uint16_t *ht = (uint16_t *)(void *)head_buf;   /* free until the first match */
+    int y, c;
+    shake_x = shake_y = 0;
+    gfx_Wait();
+    bg_draw(0, 0, SCR_W, SCR_H);
+    gfx_SetClipRegion(0, 0, SCR_W, SCR_H);
+    TEST_HOOK(test_bg_proc());
+    memset(ht, 0xFF, BGC_HASH * sizeof(uint16_t));
+    bgc_n = 0;
+    for (y = 0; y < SCR_H; y++) {
+        const uint8_t *row = &gfx_vbuffer[y][0];
+        for (c = 0; c < BGC_COLS; c++) {
+            const uint8_t *p = row + c * BGC_CH;
+            uint16_t h = 0, e;
+            uint8_t k;
+            bool solid = true;
+            for (k = 0; k < BGC_CH; k++) {
+                h = (uint16_t)(h * 31u + p[k]);
+                if (p[k] != p[0]) solid = false;
+            }
+            if (solid) {
+                bgc_idx[y][c] = (uint16_t)(BGC_SOLID | p[0]);
+                continue;
+            }
+            h &= BGC_HASH - 1;
+            for (;;) {
+                e = ht[h];
+                if (e == 0xFFFFu) {
+                    if (bgc_n >= BGC_MAX) {         /* never happens with this stadium */
+                        TEST_HOOK(test_bgc_full());
+                        e = (uint16_t)(BGC_SOLID | p[0]);
+                        break;
+                    }
+                    memcpy(bgc.dict[bgc_n], p, BGC_CH);
+                    e = ht[h] = bgc_n++;
+                    break;
+                }
+                if (!memcmp(bgc.dict[e], p, BGC_CH)) break;
+                h = (uint16_t)((h + 1) & (BGC_HASH - 1));
+            }
+            bgc_idx[y][c] = e;
+        }
+    }
+    head_team[0] = head_team[1] = -1;   /* head_buf held the hash table */
+    giant_key = -1;
+    bgc_ready = true;
+    bgc_restore(0, 0, SCR_W, SCR_H);
+    TEST_HOOK(test_bg_decoded(bgc_n));
+}
+
 static void bg_full(void)
 {
     gfx_Wait();
-    bg_draw(0, 0, SCR_W, SCR_H);
+    bgc_restore(0, 0, SCR_W, SCR_H);
     gfx_SetClipRegion(0, 0, SCR_W, SCR_H);
 }
 
@@ -1452,6 +1550,14 @@ static void mark_to(uint8_t b, int x0, int y0, int x1, int y1)
     if (x1 > SCR_W) x1 = SCR_W;
     if (y1 > SCR_H) y1 = SCR_H;
     if (x0 >= x1 || y0 >= y1 || dirty_full[b]) return;
+    /* already covered by a rect of this frame? (shadows inside players ...) */
+    for (r = &dirty[b][0]; r < &dirty[b][ndirty[b]]; r++) {
+        if (x0 >= r->x0 && y0 >= r->y0 && x1 <= r->x1 && y1 <= r->y1) return;
+        if (x0 <= r->x0 && y0 <= r->y0 && x1 >= r->x1 && y1 >= r->y1) {
+            r->x0 = (int16_t)x0; r->y0 = (int16_t)y0; r->x1 = (int16_t)x1; r->y1 = (int16_t)y1;
+            return;
+        }
+    }
     if (ndirty[b] >= MAX_DIRTY) {
         dirty_full[b] = true;
         return;
@@ -1481,12 +1587,12 @@ static uint8_t restore_dirty(uint8_t b)
 {
     uint8_t i, w, touched = 0;
     if (dirty_full[b]) {
-        bg_draw(0, 0, SCR_W, SCR_H);
+        bgc_restore(0, 0, SCR_W, SCR_H);
         touched = (uint8_t)((1 << W_COUNT) - 1);
     } else {
         for (i = 0; i < ndirty[b]; i++) {
             rect_t *r = &dirty[b][i];
-            bg_draw(r->x0, r->y0, r->x1, r->y1);
+            bgc_restore(r->x0, r->y0, r->x1, r->y1);
             for (w = 0; w < W_COUNT; w++)
                 if (rect_hit(r, &wrect[w])) touched |= (uint8_t)(1 << w);
         }
@@ -1662,38 +1768,96 @@ static void draw_head(int hx, int hy, int r, int ry, uint8_t team, int dir)
 #undef R
 }
 
-/* pre-render the two legends' heads (both directions) for the match */
+/* Pre-rendered heads, cropped to the pixels actually used: the two
+   legends of the match (both directions) and, while it is in use, one
+   giant-size head. Frozen / clone tints are made from these on the fly. */
+static int8_t head_ox[2][2], head_oy[2][2], giant_ox, giant_oy;
+
+/* draw a head at the top-left of the back buffer and capture it */
+static void grab_head(gfx_sprite_t *spr, int8_t *ox, int8_t *oy, uint8_t team, int r, int dir)
+{
+    int x, y, x0 = HEAD_SW, y0 = HEAD_SH, x1 = 0, y1 = 0;
+    gfx_SetClipRegion(0, 0, HEAD_SW, HEAD_SH);
+    fill(0, 0, HEAD_SW, HEAD_SH, C_TRANSP);
+    draw_head(HEAD_CX, HEAD_CY, r, r, team, dir);
+    for (y = 0; y < HEAD_SH; y++) {
+        const uint8_t *row = &gfx_vbuffer[y][0];
+        for (x = 0; x < HEAD_SW; x++) {
+            if (row[x] == C_TRANSP) continue;
+            if (x < x0) x0 = x;
+            if (x >= x1) x1 = x + 1;
+            if (y < y0) y0 = y;
+            y1 = y + 1;
+        }
+    }
+    if (x0 >= x1) { x0 = y0 = 0; x1 = y1 = 1; }
+    spr->width = (uint8_t)(x1 - x0);
+    spr->height = (uint8_t)(y1 - y0);
+    gfx_GetSprite(spr, x0, y0);
+    *ox = (int8_t)(x0 - HEAD_CX);
+    *oy = (int8_t)(y0 - HEAD_CY);
+    gfx_SetClipRegion(0, 0, SCR_W, SCR_H);
+}
+
 static void cache_heads(uint8_t t0, uint8_t t1)
 {
     uint8_t s, d;
     for (s = 0; s < 2; s++) {
         uint8_t team = s ? t1 : t0;
-        for (d = 0; d < 2; d++) {
-            gfx_sprite_t *spr = HEAD_SPR(s, d);
-            gfx_SetClipRegion(0, 0, HEAD_SW, HEAD_SH);
-            fill(0, 0, HEAD_SW, HEAD_SH, C_TRANSP);
-            draw_head(HEAD_CX, HEAD_CY, HEAD_R, HEAD_R, team, d ? -1 : 1);
-            spr->width = HEAD_SW;
-            spr->height = HEAD_SH;
-            gfx_GetSprite(spr, 0, 0);
-        }
+        for (d = 0; d < 2; d++)
+            grab_head(HEAD_SPR(s, d), &head_ox[s][d], &head_oy[s][d], team, HEAD_R, d ? -1 : 1);
         head_team[s] = (int8_t)team;
     }
-    gfx_SetClipRegion(0, 0, SCR_W, SCR_H);
+    giant_key = -1;
+}
+
+/* make sure the giant head for (team, dir) is cached; draws in the back
+   buffer's top-left corner, so call it before that buffer is restored */
+static void cache_giant(uint8_t team, int dir)
+{
+    int8_t key = (int8_t)(team * 2 + (dir > 0 ? 0 : 1));
+    if (key == giant_key) return;
+    grab_head((gfx_sprite_t *)(void *)giant_buf, &giant_ox, &giant_oy, team, HEAD_R * 3 / 2, dir);
+    giant_key = key;
 }
 
 static void put_head(int hx, int hy, int r, int ry, uint8_t team, int dir)
 {
-    uint8_t s;
-    if (r == HEAD_R && ry == r && !cmap) {
+    uint8_t s, d = dir > 0 ? 0 : 1;
+    gfx_sprite_t *spr = NULL;
+    int ox = 0, oy = 0;
+    (void)ry;   /* cached heads are not squashed (the body still is) */
+    if (r == HEAD_R) {
         for (s = 0; s < 2; s++) {
             if (head_team[s] == (int8_t)team) {
-                gfx_TransparentSprite(HEAD_SPR(s, dir > 0 ? 0 : 1), hx - HEAD_CX, hy - HEAD_CY);
-                return;
+                spr = HEAD_SPR(s, d);
+                ox = head_ox[s][d];
+                oy = head_oy[s][d];
+                break;
             }
         }
+    } else if (r == HEAD_R * 3 / 2 && giant_key == (int8_t)(team * 2 + d)) {
+        spr = (gfx_sprite_t *)(void *)giant_buf;
+        ox = giant_ox;
+        oy = giant_oy;
     }
-    draw_head(hx, hy, r, ry, team, dir);
+    if (!spr) {
+        draw_head(hx, hy, r, ry, team, dir);
+        return;
+    }
+    if (cmap) {
+        /* frozen / clone: tinted copy of the cached head */
+        gfx_sprite_t *t = (gfx_sprite_t *)(void *)head_tmp;
+        unsigned k, n = (unsigned)spr->width * spr->height;
+        t->width = spr->width;
+        t->height = spr->height;
+        for (k = 0; k < n; k++) {
+            uint8_t c = spr->data[k];
+            t->data[k] = c == C_TRANSP ? c : cmap[c];
+        }
+        spr = t;
+    }
+    gfx_TransparentSprite(spr, hx + ox, hy + oy);
 }
 
 enum { POSE_STAND, POSE_RUN, POSE_JUMP, POSE_KICK, POSE_LIE, POSE_CELEB };
@@ -1856,6 +2020,8 @@ static void draw_particles(void)
         if (!p->life) continue;
         x = (p->x >> 4) + shake_x;
         y = (p->y >> 4) + shake_y;
+        /* not over the HUD: a dot there would force a whole widget redraw */
+        if (y < 44 || y > 204) continue;
         gfx_SetColor(p->col);
         if (p->kind == PK_STAR) {
             gfx_FillRectangle(x - 1, y, 3, 1);
@@ -2939,8 +3105,7 @@ static void match_tick(const ctrl_t *c0, const ctrl_t *c1)
         ctrl_t cel;
         uint8_t s = M.last_scorer;
         memset(&cel, 0, sizeof cel);
-        cel.jump = true;
-        update_player(s, &cel);
+        update_player(s, &cel);    /* arms up, feet down: stays under the banner */
         memset(&cel, 0, sizeof cel);
         update_player(s ^ 1, &cel);
         ball.vy += GRAV_B;
@@ -2951,15 +3116,10 @@ static void match_tick(const ctrl_t *c0, const ctrl_t *c1)
         }
         if ((M.phase_t & 1) == 0) {
             const team_t *T = &TEAMS[M.team[s]];
-            spawn(8 + rnd_n(304), 2, -8 + rnd_n(17), 4 + rnd_n(8),
+            spawn(8 + rnd_n(304), 106, -8 + rnd_n(17), 4 + rnd_n(8),
                   (rnd() & 1) ? (M.kit_alt[s] ? T->alt_shirt : T->shirt) : C_GOLD, 50, 3, PK_GRAV);
         }
-        if ((M.phase_t % 4) == 0) {
-            crowd_jump ^= 1;
-            invalidate(0, STAND_Y0, SCR_W, STAND_Y1);
-        }
         if (--M.phase_t <= 0) {
-            if (crowd_jump) { crowd_jump = 0; invalidate(0, STAND_Y0, SCR_W, STAND_Y1); }
             pl[s].celebrate = false;
             if (M.half == 2) set_phase(PH_END, 0);
             else start_kickoff(s ^ 1);
@@ -3004,6 +3164,7 @@ static void hud_layout(void)
     set_wrect(W_ICON1, 226, 208, 319, 240);
     set_wrect(W_HELP0, 1, 0, 125, 42);
     set_wrect(W_HELP1, 195, 0, 319, 42);
+    set_wrect(W_OVL, 0, 0, 0, 0);
 }
 
 static void wbump(uint8_t w)
@@ -3068,19 +3229,20 @@ static void draw_help(uint8_t side, int x, int y)
         draw_keycap(x + 3, y + 16, "<", 10);
         draw_keycap(x + 14, y + 16, "v", 10);
         draw_keycap(x + 25, y + 16, ">", 10);
-        draw_keycap(x + 42, y + 16, "ALPHA", 42);
+        draw_keycap(x + 50, y + 16, "MODE", 34);
         if (y + 17 >= 0) txt("SUP", x + 88, y + 17, C_GOLD);
         if (y + 29 >= 0) txt("v SLIDE", x + 8, y + 29, C_LTGRAY);
     } else {
-        draw_keycap(x + 39, y + 3, "STAT", 33);
-        if (y + 4 >= 0) txt("JUMP", x + 76, y + 4, C_LTGRAY);
-        draw_keycap(x + 3, y + 15, "APPS", 33);
-        draw_keycap(x + 39, y + 15, "PRGM", 33);
-        draw_keycap(x + 75, y + 15, "VARS", 33);
-        draw_keycap(x + 4, y + 28, "(", 10);
-        if (y + 29 >= 0) txt("SHOT", x + 16, y + 29, C_WHITE);
-        draw_keycap(x + 54, y + 28, ")", 10);
-        if (y + 29 >= 0) txt("SUP", x + 66, y + 29, C_GOLD);
+        draw_keycap(x + 14, y + 4, "5", 10);
+        if (y + 5 >= 0) txt("JUMP", x + 27, y + 5, C_LTGRAY);
+        draw_keycap(x + 74, y + 4, "+", 10);
+        if (y + 5 >= 0) txt("SHOT", x + 87, y + 5, C_WHITE);
+        draw_keycap(x + 3, y + 16, "1", 10);
+        draw_keycap(x + 14, y + 16, "2", 10);
+        draw_keycap(x + 25, y + 16, "3", 10);
+        draw_keycap(x + 74, y + 16, "-", 10);
+        if (y + 17 >= 0) txt("SUP", x + 88, y + 17, C_GOLD);
+        if (y + 29 >= 0) txt("2 SLIDE", x + 8, y + 29, C_LTGRAY);
     }
 }
 
@@ -3132,7 +3294,7 @@ static void draw_icon(uint8_t side)
         int lx = cx + 6, ly = cy + 6;
         fill(lx, ly + 1, 10, 9, C_KEYSH);
         fill(lx, ly, 10, 9, C_KEYCAP);
-        txt(side ? ")" : "A", lx + 1, ly + 1, C_BLACK);
+        txt(side ? "-" : "M", lx + 1, ly + 1, C_BLACK);
     }
     /* ability name tag */
     {
@@ -3141,6 +3303,10 @@ static void draw_icon(uint8_t side)
         txt(POWER_SHORT[pw], bx + (60 - txt_w(POWER_SHORT[pw], 1)) / 2, 220, namec);
     }
 }
+
+static void draw_overlays(void);
+static uint8_t ovl_key(void);
+static uint8_t ovl_last = 0xFF;
 
 static void draw_widget(uint8_t w)
 {
@@ -3185,10 +3351,48 @@ static void draw_widget(uint8_t w)
         draw_icon((uint8_t)(w - W_ICON0));
         break;
     default: {
-        int slide = M.help_t < 12 ? (12 - M.help_t) * 4 : 0;
-        if (M.help_t) draw_help((uint8_t)(w - W_HELP0), w == W_HELP0 ? 1 : 195, 1 - slide);
+        if (w == W_OVL) {
+            if (ovl_last == ovl_key()) draw_overlays();   /* only inside its own rect */
+        }
+        else if (M.help_t) draw_help((uint8_t)(w - W_HELP0), w == W_HELP0 ? 1 : 195, 1);
         break;
     }
+    }
+}
+
+
+/* what the big message currently shows; a change redraws it */
+static uint8_t ovl_key(void)
+{
+    switch (M.phase) {
+    case PH_KICKOFF: return M.phase_t > 8 ? 1 : 2;
+    case PH_GOAL: {
+        int t = 75 - M.phase_t;
+        return (uint8_t)(t < 8 ? 10 + t : 20);
+    }
+    case PH_HALFTIME: return 30;
+    case PH_GGINTRO: return 31;
+    default: return 0;
+    }
+}
+
+/* big messages (READY, GOAL!, HALF TIME ...) are a widget too */
+static void ovl_update(void)
+{
+    uint8_t k = ovl_key();
+    if (k != ovl_last) {
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        ovl_last = k;
+        invalidate(wrect[W_OVL].x0, wrect[W_OVL].y0, wrect[W_OVL].x1, wrect[W_OVL].y1);
+        switch (M.phase) {
+        case PH_KICKOFF:  x0 = 98;  y0 = 64; x1 = 225; y1 = 95;  break;
+        case PH_GOAL:     x0 = 0;   y0 = 50; x1 = SCR_W; y1 = 99;  break;
+        case PH_HALFTIME: x0 = 50;  y0 = 56; x1 = 275; y1 = 110; break;
+        case PH_GGINTRO:  x0 = 70;  y0 = 56; x1 = 254; y1 = 94;  break;
+        default: break;
+        }
+        set_wrect(W_OVL, x0, y0, x1, y1);
+        wbump(W_OVL);
     }
 }
 
@@ -3208,24 +3412,27 @@ static void hud_update_versions(void)
         player_t *p = &pl[i];
         uint8_t v;
         if (p->ab_t) v = (uint8_t)(0x80 | (p->ab_t / 8));
-        else if (p->charged_t || p->power >= POWER_MAX) v = (uint8_t)(0x40 | ((M.total_ticks >> 3) & 1) | (p->charged_t ? 2 : 0));
+        else if (p->charged_t || p->power >= POWER_MAX) v = (uint8_t)(0x40 | (p->charged_t ? 2 : 0));
         else v = (uint8_t)(p->power * RING_N / POWER_MAX / 2);
         if (v != last_icon[i]) {
             last_icon[i] = v;
             wbump((uint8_t)(W_ICON0 + i));
         }
     }
-    if (M.help_t != last_help && (M.help_t < 13 || last_help == 0)) {
+    if ((M.help_t == 0) != (last_help == 0)) {
         wbump(W_HELP0);
         wbump(W_HELP1);
     }
     last_help = M.help_t;
+    ovl_update();
 }
 
 static void hud_reset(void)
 {
     uint8_t w;
     hud_layout();
+    ovl_last = 0xFF;
+    ovl_update();
     for (w = 0; w < W_COUNT; w++) {
         wver[w]++;
         wdrawn[0][w] = wdrawn[1][w] = (uint16_t)(wver[w] - 1);
@@ -3250,7 +3457,7 @@ static void draw_player(uint8_t i, bool clone)
     player_t *p = &pl[i];
     int x, gy, sc = clone ? 2 : scale_of(i);
     uint8_t pose = POSE_STAND;
-    int squash = 0, top;
+    int squash = 0, top, hw;
     if (clone) {
         int cx, cy;
         clone_pos(i, &cx, &cy);
@@ -3274,8 +3481,9 @@ static void draw_player(uint8_t i, bool clone)
     draw_char(x, gy, M.team[i], p->dir, M.kit_alt[i], pose, (uint8_t)(p->anim / 3), p->lie_dir, sc, squash);
     cmap = NULL;
     top = gy - (HEAD_DY + HEAD_R + 8) * sc / 2;
+    hw = (pose == POSE_LIE || p->down_t) ? 34 : 19;    /* half width of what was drawn */
     if (clone) {
-        mark(x - 34, top - 4, x + 35, gy + 6);
+        mark(x - hw, top - 4, x + hw + 1, gy + 6);
         return;
     }
     if (p->frozen_t) {
@@ -3323,7 +3531,7 @@ static void draw_player(uint8_t i, bool clone)
             mark(tx, ty, tx + 25, ty + 8);
         }
     }
-    mark(x - 34 * sc / 2, top - 6, x + 35 * sc / 2, gy + 6);
+    mark(x - hw * sc / 2, top - 6, x + hw * sc / 2 + 1, gy + 6);
 }
 
 /* glowing barrier in front of the goal (drawn over the players) */
@@ -3408,7 +3616,6 @@ static void overlay_text(const char *s, int y, uint8_t c, uint8_t sc)
 {
     int w = txt_w(s, sc);
     txt_outline(s, (SCR_W - w) / 2, y, c, sc);
-    mark((SCR_W - w) / 2 - 2, y - 2, (SCR_W + w) / 2 + 2, y + 8 * sc + 3);
 }
 
 static void draw_overlays(void)
@@ -3425,23 +3632,23 @@ static void draw_overlays(void)
         int t = 75 - M.phase_t;
         int bw = t < 8 ? t * 40 : SCR_W;            /* banner sweeps in */
         int bx = (SCR_W - bw) / 2;
-        fill(bx, 54, bw, 48, C_GOLD);
-        fill(bx, 57, bw, 42, col);
-        fill(bx, 57, bw, 3, (uint8_t)(col + 1));
+        fill(bx, 50, bw, 3, C_GOLD);
+        fill(bx, 53, bw, 3, (uint8_t)(col + 1));
+        fill(bx, 56, bw, 39, col);
+        fill(bx, 95, bw, 3, C_GOLD);
         if (t >= 6) {
             /* chunky segment letters: G O A L ! */
             static const uint8_t GOAL_SEG[4] = { 0x3D, 0x3F, 0x77, 0x38 };
-            uint8_t lc = (M.phase_t & 4) ? C_GOLD : C_WHITE, k;
+            uint8_t lc = C_WHITE, k;
             int lx = 160 - (4 * 26 + 8) / 2;
-            for (k = 0; k < 4; k++) seg_rects(lx + k * 26, 61, 20, 28, 6, GOAL_SEG[k], 2, C_PANEL);
-            for (k = 0; k < 4; k++) seg_rects(lx + k * 26, 61, 20, 28, 6, GOAL_SEG[k], 0, lc);
-            fill(lx + 104 - 2, 59, 10, 22, C_PANEL);
-            fill(lx + 104 - 2, 83, 10, 10, C_PANEL);
-            fill(lx + 104, 61, 6, 18, lc);
-            fill(lx + 104, 85, 6, 6, lc);
-            txt_outline(T->name, (SCR_W - txt_w(T->name, 1)) / 2, 93, C_WHITE, 1);
+            for (k = 0; k < 4; k++) seg_rects(lx + k * 26, 57, 20, 28, 6, GOAL_SEG[k], 2, C_PANEL);
+            for (k = 0; k < 4; k++) seg_rects(lx + k * 26, 57, 20, 28, 6, GOAL_SEG[k], 0, lc);
+            fill(lx + 104 - 2, 55, 10, 22, C_PANEL);
+            fill(lx + 104 - 2, 79, 10, 10, C_PANEL);
+            fill(lx + 104, 57, 6, 18, lc);
+            fill(lx + 104, 81, 6, 6, lc);
+            txt_outline(T->name, (SCR_W - txt_w(T->name, 1)) / 2, 89, C_WHITE, 1);
         }
-        mark(0, 54, SCR_W, 102);
         break;
     }
     case PH_HALFTIME:
@@ -3464,20 +3671,22 @@ static void render_match(void)
 {
     uint8_t b = cur_buf, w, touched, i, n0;
     gfx_Wait();     /* we write pixels straight into the buffer below */
-    if (M.shake) {
-        shake_x = rnd_n(5) - 2;
-        shake_y = rnd_n(5) - 2;
+    shake_x = shake_y = 0;
+    if (full_pending) {
         dirty_full[b] = true;
-        full_pending = 2;
-    } else {
-        shake_x = shake_y = 0;
-        if (full_pending) {
-            dirty_full[b] = true;
-            full_pending--;
+        full_pending--;
+    }
+    for (i = 0; i < 2; i++) {
+        if (scale_of(i) == 3) {
+            int8_t old = giant_key;
+            cache_giant(M.team[i], pl[i].dir);
+            if (giant_key != old) mark_to(b, 0, 0, HEAD_SW, HEAD_SH);   /* restored just below */
         }
     }
+    TEST_HOOK(test_phase(0));
     touched = restore_dirty(b);
-    TEST_HOOK(test_after_restore(crowd_jump, shake_x | shake_y | full_pending));
+    TEST_HOOK(test_phase(1));
+    TEST_HOOK(test_after_restore(0, full_pending));
     gfx_SetClipRegion(0, 0, SCR_W, SCR_H);
     n0 = ndirty[b];
     /* shadows first, then bodies, ball, effects */
@@ -3490,13 +3699,17 @@ static void render_match(void)
         }
     }
     draw_shadow(PX(ball.x), ground_px(clampi(PX(ball.x), 0, SCR_W)) - PX(ball.y), 7);
+    TEST_HOOK(test_phase(2));
     for (i = 0; i < 2; i++) if (ab_on(i, PW_CLONE)) draw_player(i, true);
     draw_player(0, false);
     draw_player(1, false);
+    TEST_HOOK(test_phase(3));
     for (i = 0; i < 2; i++) if (ab_on(i, PW_WALL)) draw_wall(i);
     if (M.phase != PH_KICKOFF || (M.phase_t & 2) || M.phase_t < 12) draw_ball();
+    TEST_HOOK(test_phase(4));
     draw_particles();
-    draw_overlays();
+    TEST_HOOK(test_phase(5));
+    TEST_HOOK(test_phase(6));
     /* HUD widgets: redraw when changed, restored over, or drawn over */
     for (w = 0; w < W_COUNT; w++) {
         bool need = (touched & (1 << w)) || wdrawn[b][w] != wver[w];
@@ -3506,10 +3719,13 @@ static void render_match(void)
             if (dirty_full[b]) need = true;
         }
         if (need) {
+            TEST_HOOK(test_wcost(0xFF));
             draw_widget(w);
+            TEST_HOOK(test_wcost(w));
             wdrawn[b][w] = wver[w];
         }
     }
+    TEST_HOOK(test_phase(7));
     TEST_HOOK(test_match_frame());
     gfx_SwapDraw();
     cur_buf ^= 1;
@@ -3528,7 +3744,7 @@ static void full_redraw_both(void)
     }
     cur_buf = 0;
     hud_reset();
-    TEST_HOOK(test_bg_ready(crowd_jump));
+    TEST_HOOK(test_bg_ready(0));
 }
 
 /* ------------------------------------------------------------------ */
@@ -3597,21 +3813,57 @@ static void match_setup(uint8_t mode, uint8_t t0, uint8_t t1, bool h0, bool h1,
         pl[i].power = 0;
     }
     clear_particles();
-    crowd_jump = 0;
     cache_heads(t0, t1);
     start_kickoff(-1);
+}
+
+/* positions before the latest tick, for the in-between frame */
+static int ip_x[3], ip_y[3];
+
+static void ip_save(void)
+{
+    ip_x[0] = pl[0].x; ip_y[0] = pl[0].y;
+    ip_x[1] = pl[1].x; ip_y[1] = pl[1].y;
+    ip_x[2] = ball.x;  ip_y[2] = ball.y;
+}
+
+static void ip_mid(int *v, int prev)
+{
+    int d = *v - prev;
+    if (d > -24 * FP && d < 24 * FP) *v = prev + d / 2;   /* jumps (resets, teleport) snap */
+}
+
+static void render_between(void)
+{
+    int sx0 = pl[0].x, sy0 = pl[0].y, sx1 = pl[1].x, sy1 = pl[1].y, bx = ball.x, by = ball.y;
+    ip_mid(&pl[0].x, ip_x[0]); ip_mid(&pl[0].y, ip_y[0]);
+    ip_mid(&pl[1].x, ip_x[1]); ip_mid(&pl[1].y, ip_y[1]);
+    ip_mid(&ball.x, ip_x[2]);  ip_mid(&ball.y, ip_y[2]);
+    TEST_HOOK(test_logic_frame());
+    render_match();
+    pl[0].x = sx0; pl[0].y = sy0; pl[1].x = sx1; pl[1].y = sy1; ball.x = bx; ball.y = by;
 }
 
 static uint8_t play_match(void)
 {
     ctrl_t c[2], latch[2];
     uint8_t i, steps;
+    bool mid_drawn = false;
 
     memset(latch, 0, sizeof latch);
     full_redraw_both();
     tick_reset();
     for (;;) {
+        /* 60 FPS: half-way through each 30 Hz tick, draw the newest state;
+           right after a tick, draw half-way between the last two states */
         while (!tick_due()) {
+            if (!mid_drawn && (long)(clock() - (next_tick - TICK_CLK / 2)) >= 0) {
+                mid_drawn = true;
+#ifdef FBL_HOST_TEST
+                if (!test_headless())
+#endif
+                render_match();
+            }
         }
         steps = 0;
         do {
@@ -3643,6 +3895,7 @@ static uint8_t play_match(void)
                     memset(&latch[i], 0, sizeof latch[i]);
                 }
             }
+            ip_save();
             match_tick(&c[0], &c[1]);
             anim_palette(M.total_ticks, M.phase == PH_GOAL);
             hud_update_versions();
@@ -3655,10 +3908,11 @@ static uint8_t play_match(void)
             }
         } while (tick_due() && steps < 3);
         if (tick_due()) tick_reset();
+        mid_drawn = false;
 #ifdef FBL_HOST_TEST
         if (test_headless()) continue;
 #endif
-        render_match();
+        render_between();
     }
 }
 
@@ -3898,16 +4152,15 @@ static void controls_screen(void)
     draw_help(1, 166, 30);
     txt("PLAYER 1", 60, 74, C_WHITE);
     txt("PLAYER 2", 196, 74, C_WHITE);
-    txt("PRGM = SLIDE", 180, 84, C_GOLD);
     txt("JUMP while near the ball: header", 8, 100, C_LTGRAY);
     txt("SHOT on the ground: low drive", 8, 112, C_LTGRAY);
     txt("SHOT in the air: volley / header", 8, 124, C_LTGRAY);
     txt("Touch the ball to fill the ring.", 8, 140, C_LTGRAY);
     txt("Ring full: SUPER fires your", 8, 152, C_LTGRAY);
     txt("legend's ability.", 8, 164, C_LTGRAY);
-    txt("CLEAR: pause.  Both players can", 8, 180, C_LTGRAY);
-    txt("hold any of their keys together:", 8, 192, C_LTGRAY);
-    txt("the two key sets never ghost.", 8, 204, C_LTGRAY);
+    txt("CLEAR: pause.", 8, 180, C_LTGRAY);
+    txt("P2 plays on the number keys:", 8, 192, C_LTGRAY);
+    txt("1 3 run, 5 jump, 2 slide.", 8, 204, C_LTGRAY);
     footer("PRESS 2ND OR CLEAR");
     show();
     wait_ok(SCR_ID_CONTROLS);
